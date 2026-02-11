@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MoonCreditFi</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+    <script type="module">
+      // Only load the dev-only .gpt_engineer script when running on localhost to avoid
+      // 404 errors and cross-origin postMessage in production.
+      (function() {
+        try {
+          const host = location.hostname;
+          if (host === 'localhost' || host === '127.0.0.1') {
+            const s = document.createElement('script');
+            s.type = 'module';
+            s.src = '/.gpt_engineer/index.js';
+            document.body.appendChild(s);
+          }
+        } catch (e) {
+          // ignore
+        }
+      })();
+    </script>
+  </body>
+</html>

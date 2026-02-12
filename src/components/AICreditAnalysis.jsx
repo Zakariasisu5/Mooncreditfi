@@ -29,6 +29,11 @@ const AICreditAnalysis = ({ walletData, onAnalysisComplete }) => {
       return;
     }
 
+    if (!supabase) {
+      toast.error('Supabase is not configured');
+      return;
+    }
+
     setIsAnalyzing(true);
     try {
       const { data, error } = await supabase.functions.invoke('ai-credit-analysis', {

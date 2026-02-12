@@ -24,6 +24,11 @@ export const SupabaseAuthProviderInner = ({ children }) => {
   const queryClient = useQueryClient();
 
   useEffect(() => {
+    if (!supabase) {
+      setLoading(false);
+      return;
+    }
+
     const getSession = async () => {
       setLoading(true);
       setTimedOut(false);

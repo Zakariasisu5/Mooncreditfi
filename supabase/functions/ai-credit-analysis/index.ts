@@ -44,20 +44,152 @@ OUTPUT FORMAT (STRICT JSON):
 
 IMPORTANT: Return ONLY the JSON object, no markdown formatting, no code blocks, just pure JSON.`;
 
+function buildFallbackAnalysis(walletData: any) {
+  const {
+    walletAge = 0,
+    transactionFrequency = "low",
+    transactionCount = 0,
+    totalVolume = 0,
+    defiInteractions = false,
+    repaidLoans = 0,
+    totalLoans = 0,
+    onTimeRate = 0,
+    activityConsistency = "low",
+    riskFlags = [],
+  } = walletData || {};
+
+  let score = 50;
+
+  // Wallet age
+  if (walletAge < 1) score -= 15;
+  else if (walletAge >= 6) score += 10;
+
+  // Activity / volume
+  if (transactionCount > 50 || totalVolume > 5000) score += 10;
+  if (transactionCount < 5 && totalVolume < 200) score -= 10;
+
+  // DeFi usage
+  if (defiInteractions) score += 5;
+
+  // Repayment behavior
+  if (totalLoans > 0) {
+    const repaymentRatio = repaidLoans / totalLoans;
+    if (repaymentRatio >= 0.9) score += 15;
+    else if (repaymentRatio >= 0.5) score += 5;
+    else score -= 20;
+  }
+
+  // On‑time rate
+  if (onTimeRate >= 95) score += 10;
+  else if (onTimeRate >= 80) score += 5;
+  else if (onTimeRate > 0) score -= 10;
+
+  // Risk flags
+  if (Array.isArray(riskFlags) && riskFlags.length > 0) {
+    score -= 10 + riskFlags.length * 5;
+  }
+
+  // Clamp
+  score = Math.max(0, Math.min(100, Math.round(score)));
+
+  let risk_level: "Low" | "Medium" | "High" = "Medium";
+  if (score >= 75) risk_level = "Low";
+  else if (score <= 40) risk_level = "High";
+
+  const loan_eligibility: "Eligible" | "Not Eligible" =
+    score >= 45 && risk_level !== "High" ? "Eligible" : "Not Eligible";
+
+  let recommended_loan_amount_usd = 50;
+  if (loan_eligibility === "Eligible") {
+    if (score >= 80) recommended_loan_amount_usd = 500;
+    else if (score >= 65) recommended_loan_amount_usd = 250;
+    else if (score >= 50) recommended_loan_amount_usd = 100;
+  } else {
+    recommended_loan_amount_usd = 25;
+  }
+
+  const explanation =
+    loan_eligibility === "Eligible"
+      ? "Based on your wallet history, you show generally responsible on‑chain behavior, so you qualify for a small starter loan."
+      : "Your wallet history is still limited or shows some risk, so we recommend starting with very small amounts while you build a stronger track record.";
+
+  const ai_reasoning_summary = [
+    `Wallet age: ${walletAge} month(s), activity: ${transactionFrequency}, total tx: ${transactionCount}.`,
+    `Repayment behavior and on‑time rate were factored into the score along with DeFi usage and any risk flags.`,
+    `Score and risk level are calibrated for conservative, micro‑loan friendly limits.`,
+  ];
+
+  return {
+    credit_score: score,
+    risk_level,
+    loan_eligibility,
+    recommended_loan_amount_usd,
+    explanation,
+    ai_reasoning_summary,
+  };
+}
+
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
 
+  if (req.method !== 'POST') {
+    return new Response(
+      JSON.stringify({ error: 'Method not allowed. Use POST.' }),
+      {
+        status: 405,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }
+    );
+  }
+
   try {
-    const { walletData } = await req.json();
+    const rawBody = await req.text();
+    if (!rawBody?.trim()) {
+      return new Response(
+        JSON.stringify({ error: 'Request body is required.' }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        }
+      );
+    }
+
+    let parsedBody;
+    try {
+      parsedBody = JSON.parse(rawBody);
+    } catch {
+      return new Response(
+        JSON.stringify({ error: 'Invalid JSON body.' }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        }
+      );
+    }
+
+    const { walletData } = parsedBody;
+    if (!walletData || typeof walletData !== 'object' || !walletData.walletAddress) {
+      return new Response(
+        JSON.stringify({ error: 'walletData with walletAddress is required.' }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        }
+      );
+    }
     
     console.log('Received wallet data for analysis:', walletData);
 
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) {
-      throw new Error("LOVABLE_API_KEY is not configured");
+      console.warn("LOVABLE_API_KEY is not configured, using fallback scoring logic.");
+      const fallback = buildFallbackAnalysis(walletData);
+      return new Response(JSON.stringify({ analysis: fallback, source: "fallback" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     // Format wallet data for the AI
@@ -122,7 +254,11 @@ Provide your comprehensive credit risk assessment.`;
 
     const aiContent = data.choices?.[0]?.message?.content;
     if (!aiContent) {
-      throw new Error("No content in AI response");
+      console.warn("No content in AI response, using fallback scoring logic.");
+      const fallback = buildFallbackAnalysis(walletData);
+      return new Response(JSON.stringify({ analysis: fallback, source: "fallback" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     // Parse the JSON response from AI
@@ -135,18 +271,35 @@ Provide your comprehensive credit risk assessment.`;
         .trim();
       creditAnalysis = JSON.parse(cleanedContent);
     } catch (parseError) {
-      console.error("Failed to parse AI response:", aiContent);
-      throw new Error("AI returned invalid JSON format");
+      console.error("Failed to parse AI response, using fallback instead. Raw content:", aiContent);
+      const fallback = buildFallbackAnalysis(walletData);
+      return new Response(JSON.stringify({ analysis: fallback, source: "fallback" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     console.log('Credit analysis complete:', creditAnalysis);
 
-    return new Response(JSON.stringify({ analysis: creditAnalysis }), {
+    return new Response(JSON.stringify({ analysis: creditAnalysis, source: "ai" }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
 
   } catch (error) {
-    console.error("Credit analysis error:", error);
+    console.error("Credit analysis error, falling back to local scoring:", error);
+    try {
+      const url = new URL(req.url);
+      const walletParam = url.searchParams.get("walletData");
+      const walletData = walletParam ? JSON.parse(walletParam) : null;
+      if (walletData) {
+        const fallback = buildFallbackAnalysis(walletData);
+        return new Response(JSON.stringify({ analysis: fallback, source: "fallback" }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    } catch {
+      // ignore secondary failures, will return generic error below
+    }
+
     return new Response(
       JSON.stringify({ 
         error: error instanceof Error ? error.message : "Unknown error occurred" 

@@ -32,7 +32,7 @@ const Index = () => {
     address: LENDING_POOL_ADDRESS,
     abi: LENDING_POOL_ABI,
     functionName: 'lenders',
-    args: [address],
+    args: address ? [address] : undefined,
     query: { enabled: isConnected && !!address }
   });
 
@@ -41,16 +41,20 @@ const Index = () => {
     address: LENDING_POOL_ADDRESS,
     abi: LENDING_POOL_ABI,
     functionName: 'calculateYieldEarned',
-    args: [address],
-    query: { enabled: isConnected && !!address }
+    args: address ? [address] : undefined,
+    query: {
+      enabled: isConnected && !!address,
+      refetchInterval: 15_000,
+      refetchIntervalInBackground: true,
+    }
   });
 
   // Credit profile
-  const { data: creditProfile, refetch: refetchCredit } = useReadContract({
+  const { data: creditScoreData, refetch: refetchCredit } = useReadContract({
     address: CREDIT_PROFILE_ADDRESS,
     abi: CREDIT_PROFILE_ABI,
-    functionName: 'getProfile',
-    args: [address],
+    functionName: 'getScore',
+    args: address ? [address] : undefined,
     query: { enabled: isConnected && !!address }
   });
 
@@ -66,7 +70,7 @@ const Index = () => {
     address: LENDING_POOL_ADDRESS,
     abi: LENDING_POOL_ABI,
     functionName: 'borrowers',
-    args: [address],
+    args: address ? [address] : undefined,
     query: { enabled: isConnected && !!address }
   });
 
@@ -84,8 +88,9 @@ const Index = () => {
   // Parse values with safe defaults
   const depositedBalance = lenderInfo?.[0] ? formatEther(lenderInfo[0]) : '0';
   const yieldEarned = yieldData ? formatEther(yieldData) : '0';
-  const creditScore = creditProfile?.[0] ? Number(creditProfile[0]) : 0;
-  const activeLoanAmount = borrowerInfo?.[0] ? formatEther(borrowerInfo[0]) : '0';
+  const creditScore = creditScoreData != null ? Number(creditScoreData) : 0;
+  const hasActiveLoan = borrowerInfo?.[4] ?? false;
+  const activeLoanAmount = hasActiveLoan && borrowerInfo?.[0] ? formatEther(borrowerInfo[0]) : '0';
   const totalDeposited = poolStats?.[0] ? formatEther(poolStats[0]) : '0';
   const currentAPY = poolStats?.[4] ? Number(poolStats[4]) / 100 : 8.5;
 
@@ -136,7 +141,7 @@ const Index = () => {
           />
           <StatsCard
             title="Yield Earned"
-            value={`${parseFloat(yieldEarned).toFixed(4)} CTC`}
+            value={`${parseFloat(yieldEarned).toFixed(8)} CTC`}
             description="Total earnings from lending"
             icon={TrendingUp}
             trend={parseFloat(yieldEarned) > 0 ? 8.5 : 0}

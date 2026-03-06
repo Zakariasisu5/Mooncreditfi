@@ -3,15 +3,21 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Progress } from '@/components/ui/progress';
 import StatsCard from '@/components/StatsCard';
 import { LENDING_POOL_ADDRESS, LENDING_POOL_ABI, DEPIN_FINANCE_ADDRESS, DEPIN_FINANCE_ABI } from '@/hooks/useContract';
-import { useReadContract, useBlockNumber, useWatchContractEvent, useAccount } from 'wagmi';
-import { formatEther } from 'viem';
+import { useReadContract, useBlockNumber, useWatchContractEvent, usePublicClient } from 'wagmi';
+import { formatEther, parseAbiItem } from 'viem';
 import { useState, useEffect } from 'react';
 import { TrendingUp, DollarSign, Users, Droplets, Activity, BarChart3, PiggyBank, Coins } from 'lucide-react';
 import { LineChart, Line, BarChart, Bar, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
+const DAY_SECONDS = 24 * 60 * 60;
+
+function formatChartDay(unixSeconds) {
+  return new Date(unixSeconds * 1000).toISOString().slice(5, 10);
+}
+
 const DeFiInsights = () => {
-  const { address } = useAccount();
   const { data: blockNumber } = useBlockNumber({ watch: true });
+  const publicClient = usePublicClient();
 
   // Read pool stats from LendingPool contract
   const { data: poolStats, refetch: refetchPoolStats } = useReadContract({
@@ -76,40 +82,231 @@ const DeFiInsights = () => {
   // Real-time counters from events
   const [activeLoansCount, setActiveLoansCount] = useState(0);
   const [dailyVolumeSum, setDailyVolumeSum] = useState(0);
-
-  // Generate realistic chart data from on-chain values
-  const generateChartData = () => {
-    const baseValue = lendingTVL > 0 ? lendingTVL : 1000;
-    const data = [];
-    for (let i = 30; i >= 0; i--) {
-      const date = new Date();
-      date.setDate(date.getDate() - i);
-      const variance = 1 + (Math.random() - 0.5) * 0.1;
-      data.push({
-        date: date.toISOString().slice(5, 10),
-        tvl: baseValue * variance * (1 + (30 - i) * 0.01),
-        lending: lendingPool.currentAPY * (0.9 + Math.random() * 0.2),
-        borrowing: (lendingPool.currentAPY + 2) * (0.9 + Math.random() * 0.2),
-        lenders: Math.floor(10 + i * 2 + Math.random() * 5),
-        borrowers: Math.floor(5 + i + Math.random() * 3),
-        volume: baseValue * 0.1 * (0.5 + Math.random()),
-        loans: Math.floor(Math.random() * 10 + 5),
-      });
-    }
-    return data;
-  };
+  const [tx24hCount, setTx24hCount] = useState(0);
 
   const [chartData, setChartData] = useState([]);
+  const [chartStatus, setChartStatus] = useState({ loading: true, error: null });
   
   useEffect(() => {
-    setChartData(generateChartData());
-  }, [poolStats]);
+    let cancelled = false;
+
+    async function buildLiveAnalytics() {
+      if (!publicClient) return;
+
+      setChartStatus({ loading: true, error: null });
+
+      try {
+        const toBlock = await publicClient.getBlockNumber();
+
+        // Estimate block time to pick a reasonable fromBlock for "last 30 days"
+        const sampleDelta = 500n;
+        const fromSample = toBlock > sampleDelta ? toBlock - sampleDelta : 1n;
+        const [bNow, bPast] = await Promise.all([
+          publicClient.getBlock({ blockNumber: toBlock }),
+          publicClient.getBlock({ blockNumber: fromSample }),
+        ]);
+
+        const nowTs = Number(bNow.timestamp);
+        const pastTs = Number(bPast.timestamp);
+        const dt = Math.max(1, nowTs - pastTs);
+        const blocks = Number(toBlock - fromSample);
+        const blockTimeSeconds = dt / Math.max(1, blocks);
+
+        const days = 30;
+        const approxBlocksBack = BigInt(Math.ceil((days * DAY_SECONDS) / Math.max(0.5, blockTimeSeconds)));
+        const fromBlock = toBlock > approxBlocksBack ? toBlock - approxBlocksBack : 1n;
+
+        const borrowedEvent = parseAbiItem('event Borrowed(address indexed borrower, uint256 amount, uint256 interestRate)');
+        const repaidEvent = parseAbiItem('event Repaid(address indexed borrower, uint256 principal, uint256 interest)');
+        const depositedEvent = parseAbiItem('event Deposited(address indexed lender, uint256 amount)');
+        const withdrawnEvent = parseAbiItem('event Withdrawn(address indexed lender, uint256 amount, uint256 yield)');
+
+        const [borrowLogs, repayLogs, depositLogs, withdrawLogs] = await Promise.all([
+          publicClient.getLogs({ address: LENDING_POOL_ADDRESS, event: borrowedEvent, fromBlock, toBlock }),
+          publicClient.getLogs({ address: LENDING_POOL_ADDRESS, event: repaidEvent, fromBlock, toBlock }),
+          publicClient.getLogs({ address: LENDING_POOL_ADDRESS, event: depositedEvent, fromBlock, toBlock }),
+          publicClient.getLogs({ address: LENDING_POOL_ADDRESS, event: withdrawnEvent, fromBlock, toBlock }),
+        ]);
+
+        const blockTsCache = new Map();
+        const uniqueBlocks = new Set([
+          ...borrowLogs.map((l) => l.blockNumber),
+          ...repayLogs.map((l) => l.blockNumber),
+          ...depositLogs.map((l) => l.blockNumber),
+          ...withdrawLogs.map((l) => l.blockNumber),
+        ]);
+
+        await Promise.all(
+          Array.from(uniqueBlocks).map(async (bn) => {
+            if (bn == null) return;
+            const block = await publicClient.getBlock({ blockNumber: bn });
+            blockTsCache.set(bn, Number(block.timestamp));
+          })
+        );
+
+        const dayStart = nowTs - days * DAY_SECONDS;
+        const window24hStart = nowTs - DAY_SECONDS;
+        const dayBuckets = new Map();
+        for (let i = 0; i <= days; i += 1) {
+          const ts = dayStart + i * DAY_SECONDS;
+          dayBuckets.set(formatChartDay(ts), {
+            date: formatChartDay(ts),
+            volume: 0,
+            loans: 0,
+            netDeposits: 0,
+            newLenders: new Set(),
+            newBorrowers: new Set(),
+          });
+        }
+
+        const addToDay = (bn, cb) => {
+          const ts = blockTsCache.get(bn);
+          if (ts == null) return;
+          if (ts < dayStart - DAY_SECONDS) return;
+          const key = formatChartDay(ts);
+          const bucket = dayBuckets.get(key);
+          if (!bucket) return;
+          cb(bucket);
+        };
+
+        let volume24hBase = 0;
+        let tx24hBase = 0;
+        let borrowsInWindow = 0;
+        let repaysInWindow = 0;
+
+        borrowLogs.forEach((log) => {
+          addToDay(log.blockNumber, (b) => {
+            const amt = log.args?.amount ? Number(formatEther(log.args.amount)) : 0;
+            b.volume += amt;
+            b.loans += 1;
+            if (log.args?.borrower) b.newBorrowers.add(String(log.args.borrower).toLowerCase());
+          });
+
+          const ts = blockTsCache.get(log.blockNumber);
+          if (ts != null && ts >= window24hStart) {
+            const amt = log.args?.amount ? Number(formatEther(log.args.amount)) : 0;
+            volume24hBase += amt;
+            tx24hBase += 1;
+          }
+        });
+
+        repayLogs.forEach((log) => {
+          addToDay(log.blockNumber, (b) => {
+            const principal = log.args?.principal ? Number(formatEther(log.args.principal)) : 0;
+            const interest = log.args?.interest ? Number(formatEther(log.args.interest)) : 0;
+            b.volume += principal + interest;
+          });
+
+          const ts = blockTsCache.get(log.blockNumber);
+          if (ts != null && ts >= window24hStart) {
+            const principal = log.args?.principal ? Number(formatEther(log.args.principal)) : 0;
+            const interest = log.args?.interest ? Number(formatEther(log.args.interest)) : 0;
+            volume24hBase += principal + interest;
+            tx24hBase += 1;
+          }
+        });
+
+        depositLogs.forEach((log) => {
+          addToDay(log.blockNumber, (b) => {
+            const amt = log.args?.amount ? Number(formatEther(log.args.amount)) : 0;
+            b.netDeposits += amt;
+            if (log.args?.lender) b.newLenders.add(String(log.args.lender).toLowerCase());
+          });
+        });
+
+        withdrawLogs.forEach((log) => {
+          addToDay(log.blockNumber, (b) => {
+            const amt = log.args?.amount ? Number(formatEther(log.args.amount)) : 0;
+            b.netDeposits -= amt;
+          });
+        });
+
+        // Anchor TVL series to current on-chain totalDeposited, then step backwards with netDeposits.
+        const currentTVL = Number.isFinite(lendingTVL) && lendingTVL > 0 ? lendingTVL : 0;
+        const ordered = Array.from(dayBuckets.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+        // Build cumulative unique users in-window (still live, but windowed)
+        const lendersSet = new Set();
+        const borrowersSet = new Set();
+
+        // Reverse-cumulate TVL using netDeposits
+        let tvlCursor = currentTVL;
+        const tvlByDate = new Map();
+        for (let i = ordered.length - 1; i >= 0; i -= 1) {
+          const row = ordered[i];
+          tvlByDate.set(row.date, tvlCursor);
+          tvlCursor = Math.max(0, tvlCursor - row.netDeposits);
+        }
+
+        const finalData = ordered.map((row) => {
+          row.newLenders.forEach((x) => lendersSet.add(x));
+          row.newBorrowers.forEach((x) => borrowersSet.add(x));
+
+          return {
+            date: row.date,
+            tvl: tvlByDate.get(row.date) ?? 0,
+            lending: lendingPool.currentAPY,
+            borrowing: lendingPool.currentAPY + 2,
+            lenders: lendersSet.size,
+            borrowers: borrowersSet.size,
+            volume: row.volume,
+            loans: row.loans,
+          };
+        });
+
+        // Active loans estimate (windowed): track borrower state from Borrowed/Repaid ordering
+        const loanStateByBorrower = new Map();
+        const activity = [];
+
+        borrowLogs.forEach((log) => {
+          const borrower = log.args?.borrower ? String(log.args.borrower).toLowerCase() : null;
+          const ts = blockTsCache.get(log.blockNumber);
+          if (!borrower || ts == null) return;
+          activity.push({ ts, kind: 'borrow', borrower, logIndex: Number(log.logIndex ?? 0n) });
+        });
+
+        repayLogs.forEach((log) => {
+          const borrower = log.args?.borrower ? String(log.args.borrower).toLowerCase() : null;
+          const ts = blockTsCache.get(log.blockNumber);
+          if (!borrower || ts == null) return;
+          activity.push({ ts, kind: 'repay', borrower, logIndex: Number(log.logIndex ?? 0n) });
+        });
+
+        activity.sort((a, b) => (a.ts - b.ts) || (a.logIndex - b.logIndex));
+        activity.forEach((evt) => {
+          loanStateByBorrower.set(evt.borrower, evt.kind === 'borrow');
+        });
+
+        const activeLoansLive = Array.from(loanStateByBorrower.values()).filter(Boolean).length;
+
+        if (!cancelled) {
+          setChartData(finalData);
+          setDailyVolumeSum(volume24hBase);
+          setTx24hCount(tx24hBase);
+          setActiveLoansCount(activeLoansLive);
+          setChartStatus({ loading: false, error: null });
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setChartStatus({ loading: false, error: e instanceof Error ? e.message : 'Failed to load on-chain analytics' });
+        }
+      }
+    }
+
+    buildLiveAnalytics();
+    const interval = setInterval(buildLiveAnalytics, 60_000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [publicClient, lendingTVL, lendingPool.currentAPY]);
 
   // Listen for Borrow events
   useWatchContractEvent({
     address: LENDING_POOL_ADDRESS,
     abi: LENDING_POOL_ABI,
-    eventName: 'Borrow',
+    eventName: 'Borrowed',
     onLogs(logs) {
       logs.forEach(log => {
         try {
@@ -118,6 +315,7 @@ const DeFiInsights = () => {
             const value = Number(formatEther(amount));
             setActiveLoansCount((n) => n + 1);
             setDailyVolumeSum((s) => s + value);
+            setTx24hCount((c) => c + 1);
           }
         } catch (e) {
           console.warn('Error parsing Borrow event', e);
@@ -130,15 +328,17 @@ const DeFiInsights = () => {
   useWatchContractEvent({
     address: LENDING_POOL_ADDRESS,
     abi: LENDING_POOL_ABI,
-    eventName: 'Repay',
+    eventName: 'Repaid',
     onLogs(logs) {
       logs.forEach(log => {
         try {
-          const amount = log.args?.amount;
-          if (amount) {
-            const value = Number(formatEther(amount));
+          const principal = log.args?.principal;
+          const interest = log.args?.interest;
+          if (principal || interest) {
+            const value = Number(formatEther(principal ?? 0n)) + Number(formatEther(interest ?? 0n));
             setActiveLoansCount((n) => Math.max(0, n - 1));
             setDailyVolumeSum((s) => s + value);
+            setTx24hCount((c) => c + 1);
           }
         } catch (e) {
           console.warn('Error parsing Repay event', e);
@@ -294,7 +494,7 @@ const DeFiInsights = () => {
                   </div>
                   <div className="space-y-2">
                     <p className="text-sm text-muted-foreground">Transactions</p>
-                    <p className="text-2xl font-bold">{activeLoansCount}</p>
+                    <p className="text-2xl font-bold">{tx24hCount}</p>
                   </div>
                 </div>
                 <div className="space-y-2">
@@ -345,6 +545,11 @@ const DeFiInsights = () => {
                 </CardTitle>
               </CardHeader>
               <CardContent>
+                {chartStatus.error ? (
+                  <div className="text-sm text-destructive">
+                    Failed to load live analytics: {chartStatus.error}
+                  </div>
+                ) : null}
                 <ResponsiveContainer width="100%" height={250}>
                   <AreaChart data={chartData}>
                     <defs>

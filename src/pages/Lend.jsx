@@ -45,7 +45,11 @@ const Lend = () => {
     abi: LENDING_POOL_ABI,
     functionName: 'calculateYieldEarned',
     args: address ? [address] : undefined,
-    query: { enabled: !!address },
+    query: {
+      enabled: !!address,
+      refetchInterval: 15_000,
+      refetchIntervalInBackground: true,
+    },
   });
 
   // Read pool stats
@@ -73,8 +77,11 @@ const Lend = () => {
       setIsClaiming(false);
       setDepositAmount('');
       toast.success('Transaction confirmed!');
+      refetchLenderInfo?.();
+      refetchYield?.();
+      refetchPoolStats?.();
     }
-  }, [isConfirmed]);
+  }, [isConfirmed, refetchLenderInfo, refetchYield, refetchPoolStats]);
 
   // Parse data with safe defaults
   const depositedBalance = lenderInfo?.[0] ? formatEther(lenderInfo[0]) : '0';
@@ -404,7 +411,7 @@ const Lend = () => {
                         <span className="text-xs sm:text-sm text-muted-foreground">Yield Earned</span>
                         <p className="text-[10px] sm:text-xs text-green-500">Claimable now</p>
                       </div>
-                      <span className="font-bold text-lg sm:text-xl text-green-500">+{parseFloat(yieldEarned).toFixed(6)} CTC</span>
+                      <span className="font-bold text-lg sm:text-xl text-green-500">+{parseFloat(yieldEarned).toFixed(8)} CTC</span>
                     </div>
                     <div className="flex justify-between items-center p-3 sm:p-4 bg-primary/10 rounded-lg border border-primary/20">
                       <span className="text-xs sm:text-sm font-medium">Total Value</span>
